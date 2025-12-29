@@ -16,6 +16,11 @@ namespace ble_client_hid {
 
 namespace espbt=esphome::esp32_ble_tracker;
 
+//JBR  store (handle, raw bytes)
+std::vector<std::pair<uint16_t, std::vector<uint8_t>>> pending_reports_;
+bool hid_ready_{false};
+
+
 enum class HIDState {
   // Initial state
   INIT,
