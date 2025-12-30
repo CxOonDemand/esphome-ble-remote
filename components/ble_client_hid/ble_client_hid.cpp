@@ -339,18 +339,10 @@ void BLEClientHID::process_input_report_(uint16_t handle, const uint8_t *value, 
 }
 
 void BLEClientHID::send_input_report_event(esp_ble_gattc_cb_param_t *p_data) {
-  const uint16_t handle = p_data->notify.handle;
-  const uint8_t *value = p_data->notify.value;
-  const uint16_t value_len = p_data->notify.value_len;
-
-  // NEW: if we are not fully established / parser not ready, buffer and return
-  if (!this->can_process_input_reports_()) {
-    this->queue_pending_input_report_(handle, value, value_len);
-    return;
-  }
-
-  this->process_input_report_(handle, value, value_len);
+  // This is called from ESP_GATTC_NOTIFY_EVT
+  this->process_hid_report_(p_data->notify.handle, p_data->notify.value, p_data->notify.value_len);
 }
+
 
 void BLEClientHID::register_last_event_value_sensor(sensor::Sensor *s) {
   this->last_event_value_sensor = s;
@@ -408,6 +400,8 @@ void BLEClientHID::configure_hid_client() {
   BLEService *device_info_service = this->parent()->get_service(ESP_GATT_UUID_DEVICE_INFO_SVC);
   BLEService *hid_service = this->parent()->get_service(ESP_GATT_UUID_HID_SVC);
   BLEService *generic_access_service = this->parent()->get_service(0x1800);
+  
+  this->hid_parse_ready_ = false;
 
   // NEW hygiene: rebuild parser/mappings cleanly each time
   this->handle_report_id.clear();
@@ -530,9 +524,96 @@ void BLEClientHID::configure_hid_client() {
     delete kv.second;
   }
   this->handles_to_read.clear();
+  // Mark parser ready and flush any HID notifications we buffered during setup.
+  this->hid_parse_ready_ = true;
+  this->flush_pending_hid_();
 
   // NEW: If we already reached ESTABLISHED (rare), flush immediately
   this->flush_pending_input_reports_();
+}
+
+
+void BLEClientHID::queue_pending_hid_(uint16_t handle, const uint8_t *value, uint16_t len) {
+  if (len == 0) return;
+
+  if (this->pending_hid_.size() >= MAX_PENDING_HID) {
+    this->pending_hid_.pop_front();  // drop oldest
+  }
+
+  PendingHidNotify p;
+  p.handle = handle;
+  p.value.assign(value, value + len);
+  this->pending_hid_.push_back(std::move(p));
+
+  ESP_LOGD(TAG, "Buffered HID notify (handle=%u len=%u) until parser is ready", handle, len);
+}
+
+void BLEClientHID::flush_pending_hid_() {
+  if (!this->hid_parse_ready_) return;
+  if (this->hid_report_map == nullptr) return;
+
+  while (!this->pending_hid_.empty()) {
+    auto p = std::move(this->pending_hid_.front());
+    this->pending_hid_.pop_front();
+    this->process_hid_report_(p.handle, p.value.data(), (uint16_t) p.value.size());
+  }
+}
+void BLEClientHID::process_hid_report_(uint16_t handle, const uint8_t *value, uint16_t len) {
+  ESP_LOGD(TAG, "Received HID input report from handle %d", handle);
+
+  // If we are not ready to parse yet, buffer it instead of dropping it.
+  if (!this->hid_parse_ready_ || this->hid_report_map == nullptr) {
+    this->queue_pending_hid_(handle, value, len);
+    return;
+  }
+
+  auto it = this->handle_report_id.find(handle);
+  if (it == this->handle_report_id.end()) {
+    // We still don't know the report-id for this handle; buffer and try later.
+    this->queue_pending_hid_(handle, value, len);
+    return;
+  }
+
+  const uint8_t report_id = it->second;
+
+  // Prepend report-id as the original code does.
+  std::vector<uint8_t> data;
+  data.resize((size_t)len + 1);
+  data[0] = report_id;
+  if (len > 0) {
+    memcpy(&data[1], value, len);
+  }
+
+  std::vector<HIDReportItemValue> hid_report_values = this->hid_report_map->parse(data.data());
+  if (hid_report_values.empty()) {
+    // Do NOT drop silently; it might be a timing edge. Buffer once.
+    this->queue_pending_hid_(handle, value, len);
+    return;
+  }
+
+  for (HIDReportItemValue v : hid_report_values) {
+    std::string usage;
+    if (USAGE_PAGES.count(v.usage.page) > 0 &&
+        USAGE_PAGES.at(v.usage.page).usages_.count(v.usage.usage) > 0) {
+      usage = USAGE_PAGES.at(v.usage.page).usages_.at(v.usage.usage);
+    } else {
+      usage = std::to_string(v.usage.page) + "_" + std::to_string(v.usage.usage);
+    }
+
+#ifdef USE_API
+    this->fire_homeassistant_event("esphome.hid_events",
+      {{"usage", usage}, {"value", std::to_string(v.value)}});
+#endif
+
+    if (this->last_event_usage_text_sensor != nullptr) {
+      this->last_event_usage_text_sensor->publish_state(usage);
+    }
+    if (this->last_event_value_sensor != nullptr) {
+      this->last_event_value_sensor->publish_state(v.value);
+    }
+
+    ESP_LOGI(TAG, "Send HID event to HomeAssistant: usage: %s, value: %d", usage.c_str(), v.value);
+  }
 }
 
 }  // namespace ble_client_hid
