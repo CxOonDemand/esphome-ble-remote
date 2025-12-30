@@ -19,6 +19,11 @@
 #include "esp_gap_ble_api.h"
 #include "esp_gattc_api.h"
 
+//JBR
+#include <deque>
+#include <vector>
+
+
 namespace esphome {
 namespace ble_client_hid {
 
@@ -123,6 +128,24 @@ class BLEClientHID : public ble_client::BLEClientNode, public Component {
   std::deque<PendingInputReport> pending_input_reports_;
 
   static constexpr size_t MAX_PENDING_INPUT_REPORTS = 8;
+
+  struct PendingHidNotify {
+    uint16_t handle;
+    std::vector<uint8_t> value;
+  };
+
+  std::deque<PendingHidNotify> pending_hid_;
+  static constexpr size_t MAX_PENDING_HID = 12;
+
+  // True once report map + report-id mapping is ready for parsing.
+  bool hid_parse_ready_{false};
+
+  void queue_pending_hid_(uint16_t handle, const uint8_t *value, uint16_t len);
+  void flush_pending_hid_();
+
+  // Single place that does "prepend report id + parse + fire HA event"
+  void process_hid_report_(uint16_t handle, const uint8_t *value, uint16_t len);
+
 };
 
 }  // namespace ble_client_hid
