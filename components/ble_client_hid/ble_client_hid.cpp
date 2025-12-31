@@ -6,7 +6,9 @@
 
 #ifdef USE_API
 #include "esphome/components/api/custom_api_device.h"
+static esphome::api::CustomAPIDevice ha_event_bus;
 #endif
+
 
 namespace esphome {
 namespace ble_client_hid {
@@ -17,6 +19,26 @@ static const char *const TAG = "ble_client_hid";
 // fire_homeassistant_event() lives on CustomAPIDevice (per ESPHome examples). 
 static api::CustomAPIDevice s_api;
 #endif
+
+static void fill_sleep_friendly_params_(esp_ble_conn_update_params_t &p, const uint8_t bda[6]) {
+  memset(&p, 0, sizeof(p));
+  memcpy(p.bda, bda, 6);
+
+  // Interval units are 1.25ms.
+  // 24 = 30ms, 40 = 50ms (reasonable and widely accepted)
+  p.min_int = 24;
+  p.max_int = 40;
+
+  // Slave latency = number of intervals the peripheral may skip.
+  // Higher latency => peripheral can sleep more while staying connected.
+  p.latency = 199;
+
+  // Supervision timeout units are 10ms; 3200 = 32s (max BLE spec).
+  // Must be > (1+latency)*max_interval*2 (here: (200*50ms*2)=20s, so 32s is valid)
+  p.timeout = 3200;
+}
+
+
 
 void BLEClientHID::reset_connection_state_() {
   this->battery_handle_ = 0;
@@ -56,17 +78,16 @@ void BLEClientHID::loop() {
       break;
     }
 
-    case HIDState::NOTIFICATIONS_REGISTERED: {
-      // Apply preferred connection parameters (if the device provided them).
-      if (this->preferred_params_valid_) {
-        esp_ble_gap_update_conn_params(&this->preferred_conn_params_);
-      }
-      this->hid_state_ = HIDState::CONN_PARAMS_UPDATING;
+   case HIDState::NOTIFICATIONS_REGISTERED: {
+  if (!this->preferred_conn_params_valid) {
+    fill_sleep_friendly_params_(this->preferred_conn_params, this->parent()->get_remote_bda());
+    this->preferred_conn_params_valid = true;
+  }
+  esp_ble_gap_update_conn_params(&this->preferred_conn_params);
+  this->hid_state = HIDState::CONN_PARAMS_UPDATING;
+  break;
+}
 
-      // If any buffered reports arrived before decode was ready, flush now.
-      this->flush_pending_reports_();
-      break;
-    }
 
     default:
       break;
@@ -297,19 +318,25 @@ void BLEClientHID::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
     }
 
     case ESP_GATTC_NOTIFY_EVT: {
-      if (param->notify.conn_id != this->parent()->get_conn_id()) break;
+  if (param->notify.conn_id != this->parent()->get_conn_id())
+    break;
 
-      if (p_data->notify.handle == this->battery_handle_) {
-        uint8_t battery_level = p_data->notify.value[0];
-        if (this->battery_sensor_ != nullptr) {
-          this->battery_sensor_->publish_state(battery_level);
-        }
-      } else {
-        // HID report notify; buffer/process depending on readiness.
-        this->handle_hid_notify_(p_data->notify.handle, p_data->notify.value, p_data->notify.value_len);
-      }
-      break;
+  // Battery notifications
+  if (param->notify.handle == this->battery_handle) {
+    if (param->notify.value_len >= 1 && this->battery_sensor != nullptr) {
+      this->battery_sensor->publish_state(param->notify.value[0]);
     }
+    break;
+  }
+
+  // HID report notifications
+  // IMPORTANT: do not gate this on connection-param update completion.
+  // If you already have report parsing ready, parse now; otherwise you may buffer
+  // (buffering is optional if your root cause is disconnect/wake).
+  this->send_input_report_event(param);   // or your process_* function
+  break;
+}
+
 
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
       if (param->notify.conn_id != this->parent()->get_conn_id()) break;
@@ -476,25 +503,23 @@ void BLEClientHID::configure_hid_client_() {
 
   // Preferred connection params (0x2A04) => esp_ble_conn_update_params_t
   if (generic_access_service != nullptr) {
-    uint8_t *t_conn_params = this->parse_characteristic_data_(generic_access_service, ESP_GATT_UUID_GAP_PREF_CONN_PARAM);
-    if (t_conn_params != nullptr) {
-      memset(&this->preferred_conn_params_, 0, sizeof(this->preferred_conn_params_));
-      this->preferred_conn_params_.min_int = t_conn_params[0] | (t_conn_params[1] << 8);
-      this->preferred_conn_params_.max_int = t_conn_params[2] | (t_conn_params[3] << 8);
-      this->preferred_conn_params_.latency = t_conn_params[4] | (t_conn_params[5] << 8);
-      this->preferred_conn_params_.timeout = t_conn_params[6] | (t_conn_params[7] << 8);
-      memcpy(this->preferred_conn_params_.bda, this->parent()->get_remote_bda(), 6);
+  uint8_t *t_conn_params = this->parse_characteristic_data(
+      generic_access_service, ESP_GATT_UUID_GAP_PREF_CONN_PARAM);
 
-      this->preferred_params_valid_ = true;
+  if (t_conn_params != nullptr) {
+    const uint16_t min_int = t_conn_params[0] | (t_conn_params[1] << 8);
+    const uint16_t max_int = t_conn_params[2] | (t_conn_params[3] << 8);
+    const uint16_t latency = t_conn_params[4] | (t_conn_params[5] << 8);
+    const uint16_t timeout = t_conn_params[6] | (t_conn_params[7] << 8);
 
-      ESP_LOGI(TAG,
-               "Got preferred connection parameters: interval: %.2f - %.2f ms, latency: %u, timeout: %.1f ms",
-               this->preferred_conn_params_.min_int * 1.25f,
-               this->preferred_conn_params_.max_int * 1.25f,
-               this->preferred_conn_params_.latency,
-               this->preferred_conn_params_.timeout * 10.f);
-    }
+    ESP_LOGI(TAG,
+      "Remote preferred conn params: interval %.2f-%.2f ms, latency=%u, timeout=%.1f ms",
+      min_int * 1.25f, max_int * 1.25f, latency, timeout * 10.0f);
+
+    // Do NOT apply these if your goal is preventing disconnect / missing first key.
+    // Instead, apply the sleep-friendly params in loop() (section B).
   }
+}
 
   // Delete read data (as in your original)
   for (auto &kv : this->handles_to_read_) {
