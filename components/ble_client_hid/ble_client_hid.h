@@ -99,8 +99,8 @@ class BLEClientHID : public ble_client::BLEClientNode {
   static constexpr size_t kMaxPendingReports = 16;
 
   // Preferred conn params from GAP (0x2A04)
-  esp_ble_conn_update_params_t preferred_conn_params_{};
-  bool preferred_params_valid_{false};
+  esp_ble_conn_update_params_t preferred_conn_params{};
+  bool preferred_conn_params_valid{false};
 };
 
 }  // namespace ble_client_hid
